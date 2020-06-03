@@ -154,7 +154,7 @@ class DebugViewTests(SimpleTestCase):
             self.assertContains(response, '<div class="context" id="', status_code=500)
             match = re.search(b'<div class="context" id="(?P<id>[^"]+)">', response.content)
             self.assertIsNotNone(match)
-            id_repr = match.group('id')
+            id_repr = match['id']
             self.assertFalse(
                 re.search(b'[^c0-9]', id_repr),
                 "Numeric IDs in debug response HTML page shouldn't be localized (value: %s)." % id_repr.decode()
@@ -248,6 +248,17 @@ class DebugViewTests(SimpleTestCase):
         with mock.patch.object(IntConverter, 'to_python', side_effect=Http404):
             response = self.client.get('/path-post/1/')
             self.assertContains(response, 'Page not found', status_code=404)
+
+    def test_exception_reporter_from_request(self):
+        with self.assertLogs('django.request', 'ERROR'):
+            response = self.client.get('/custom_reporter_class_view/')
+        self.assertContains(response, 'custom traceback text', status_code=500)
+
+    @override_settings(DEFAULT_EXCEPTION_REPORTER='view_tests.views.CustomExceptionReporter')
+    def test_exception_reporter_from_settings(self):
+        with self.assertLogs('django.request', 'ERROR'):
+            response = self.client.get('/raises500/')
+        self.assertContains(response, 'custom traceback text', status_code=500)
 
 
 class DebugViewQueriesAllowedTests(SimpleTestCase):
@@ -427,7 +438,14 @@ class ExceptionReporterTests(SimpleTestCase):
         self.assertEqual(last_frame['function'], 'funcName')
         self.assertEqual(last_frame['lineno'], 2)
         html = reporter.get_traceback_html()
-        self.assertIn('generated in funcName, line 2', html)
+        self.assertIn(
+            '<span class="fname">generated</span>, line 2, in funcName',
+            html,
+        )
+        self.assertIn(
+            '<code class="fname">generated</code>, line 2, in funcName',
+            html,
+        )
         self.assertIn(
             '"generated", line 2, in funcName\n'
             '    &lt;source code not available&gt;',
@@ -461,7 +479,14 @@ class ExceptionReporterTests(SimpleTestCase):
             self.assertEqual(last_frame['function'], 'funcName')
             self.assertEqual(last_frame['lineno'], 2)
             html = reporter.get_traceback_html()
-            self.assertIn('generated in funcName, line 2', html)
+            self.assertIn(
+                '<span class="fname">generated</span>, line 2, in funcName',
+                html,
+            )
+            self.assertIn(
+                '<code class="fname">generated</code>, line 2, in funcName',
+                html,
+            )
             self.assertIn(
                 '"generated", line 2, in funcName\n'
                 '    &lt;source code not available&gt;',
@@ -1224,6 +1249,41 @@ class ExceptionReporterFilterTests(ExceptionReportTestMixin, LoggingCaptureMixin
             {'login': 'cooper', 'password': reporter_filter.cleansed_substitute},
         )
 
+    def test_cleanse_setting_recurses_in_list_tuples(self):
+        reporter_filter = SafeExceptionReporterFilter()
+        initial = [
+            {
+                'login': 'cooper',
+                'password': 'secret',
+                'apps': (
+                    {'name': 'app1', 'api_key': 'a06b-c462cffae87a'},
+                    {'name': 'app2', 'api_key': 'a9f4-f152e97ad808'},
+                ),
+                'tokens': ['98b37c57-ec62-4e39', '8690ef7d-8004-4916'],
+            },
+            {'SECRET_KEY': 'c4d77c62-6196-4f17-a06b-c462cffae87a'},
+        ]
+        cleansed = [
+            {
+                'login': 'cooper',
+                'password': reporter_filter.cleansed_substitute,
+                'apps': (
+                    {'name': 'app1', 'api_key': reporter_filter.cleansed_substitute},
+                    {'name': 'app2', 'api_key': reporter_filter.cleansed_substitute},
+                ),
+                'tokens': reporter_filter.cleansed_substitute,
+            },
+            {'SECRET_KEY': reporter_filter.cleansed_substitute},
+        ]
+        self.assertEqual(
+            reporter_filter.cleanse_setting('SETTING_NAME', initial),
+            cleansed,
+        )
+        self.assertEqual(
+            reporter_filter.cleanse_setting('SETTING_NAME', tuple(initial)),
+            tuple(cleansed),
+        )
+
     def test_request_meta_filtering(self):
         request = self.rf.get('/', HTTP_SECRET_HEADER='super_secret')
         reporter_filter = SafeExceptionReporterFilter()
@@ -1238,7 +1298,7 @@ class ExceptionReporterFilterTests(ExceptionReportTestMixin, LoggingCaptureMixin
         response = self.client.get(
             '/raises500/',
             HTTP_SECRET_HEADER='super_secret',
-            HTTP_X_REQUESTED_WITH='XMLHttpRequest',
+            HTTP_ACCEPT='application/json',
         )
         self.assertNotIn(b'super_secret', response.content)
 
@@ -1280,17 +1340,17 @@ class CustomExceptionReporterFilterTests(SimpleTestCase):
         )
 
 
-class AjaxResponseExceptionReporterFilter(ExceptionReportTestMixin, LoggingCaptureMixin, SimpleTestCase):
+class NonHTMLResponseExceptionReporterFilter(ExceptionReportTestMixin, LoggingCaptureMixin, SimpleTestCase):
     """
     Sensitive information can be filtered out of error reports.
 
-    Here we specifically test the plain text 500 debug-only error page served
-    when it has been detected the request was sent by JS code. We don't check
-    for (non)existence of frames vars in the traceback information section of
-    the response content because we don't include them in these error pages.
+    The plain text 500 debug-only error page is served when it has been
+    detected the request doesn't accept HTML content. Don't check for
+    (non)existence of frames vars in the traceback information section of the
+    response content because they're not included in these error pages.
     Refs #14614.
     """
-    rf = RequestFactory(HTTP_X_REQUESTED_WITH='XMLHttpRequest')
+    rf = RequestFactory(HTTP_ACCEPT='application/json')
 
     def test_non_sensitive_request(self):
         """
@@ -1337,8 +1397,8 @@ class AjaxResponseExceptionReporterFilter(ExceptionReportTestMixin, LoggingCaptu
             self.verify_unsafe_response(custom_exception_reporter_filter_view, check_for_vars=False)
 
     @override_settings(DEBUG=True, ROOT_URLCONF='view_tests.urls')
-    def test_ajax_response_encoding(self):
-        response = self.client.get('/raises500/', HTTP_X_REQUESTED_WITH='XMLHttpRequest')
+    def test_non_html_response_encoding(self):
+        response = self.client.get('/raises500/', HTTP_ACCEPT='application/json')
         self.assertEqual(response['Content-Type'], 'text/plain; charset=utf-8')
 
 

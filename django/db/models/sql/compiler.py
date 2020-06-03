@@ -4,8 +4,9 @@ from functools import partial
 from itertools import chain
 
 from django.core.exceptions import EmptyResultSet, FieldError
+from django.db import DatabaseError, NotSupportedError
 from django.db.models.constants import LOOKUP_SEP
-from django.db.models.expressions import OrderBy, Random, RawSQL, Ref, Value
+from django.db.models.expressions import F, OrderBy, Random, RawSQL, Ref, Value
 from django.db.models.functions import Cast
 from django.db.models.query_utils import Q, select_related_descend
 from django.db.models.sql.constants import (
@@ -13,12 +14,18 @@ from django.db.models.sql.constants import (
 )
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
-from django.db.utils import DatabaseError, NotSupportedError
 from django.utils.functional import cached_property
 from django.utils.hashable import make_hashable
+from django.utils.regex_helper import _lazy_re_compile
 
 
 class SQLCompiler:
+    # Multiline ordering SQL clause may appear from RawSQL.
+    ordering_parts = _lazy_re_compile(
+        r'^(.*)\s(?:ASC|DESC).*',
+        re.MULTILINE | re.DOTALL,
+    )
+
     def __init__(self, query, connection, using):
         self.query = query
         self.connection = connection
@@ -31,8 +38,6 @@ class SQLCompiler:
         self.select = None
         self.annotation_col_map = None
         self.klass_info = None
-        # Multiline ordering SQL clause may appear from RawSQL.
-        self.ordering_parts = re.compile(r'^(.*)\s(ASC|DESC)(.*)', re.MULTILINE | re.DOTALL)
         self._meta_ordering = None
 
     def setup_query(self):
@@ -123,8 +128,8 @@ class SQLCompiler:
         for expr, (sql, params, is_ref) in order_by:
             # Skip References to the select clause, as all expressions in the
             # select clause are already part of the group by.
-            if not expr.contains_aggregate and not is_ref:
-                expressions.extend(expr.get_source_expressions())
+            if not is_ref:
+                expressions.extend(expr.get_group_by_cols())
         having_group_by = self.having.get_group_by_cols() if self.having else ()
         for expr in having_group_by:
             expressions.append(expr)
@@ -134,6 +139,7 @@ class SQLCompiler:
 
         for expr in expressions:
             sql, params = self.compile(expr)
+            sql, params = expr.select_format(self, sql, params)
             params_hash = make_hashable(params)
             if (sql, params_hash) not in seen:
                 result.append((sql, params))
@@ -355,13 +361,16 @@ class SQLCompiler:
             resolved = expr.resolve_expression(self.query, allow_joins=True, reuse=None)
             if self.query.combinator:
                 src = resolved.get_source_expressions()[0]
+                expr_src = expr.get_source_expressions()[0]
                 # Relabel order by columns to raw numbers if this is a combined
                 # query; necessary since the columns can't be referenced by the
                 # fully qualified name and the simple column names may collide.
                 for idx, (sel_expr, _, col_alias) in enumerate(self.select):
                     if is_ref and col_alias == src.refs:
                         src = src.source
-                    elif col_alias:
+                    elif col_alias and not (
+                        isinstance(expr_src, F) and col_alias == expr_src.name
+                    ):
                         continue
                     if src == sel_expr:
                         resolved.set_source_expressions([RawSQL('%d' % (idx + 1), ())])
@@ -378,7 +387,7 @@ class SQLCompiler:
             # not taken into account so we strip it. When this entire method
             # is refactored into expressions, then we can check each part as we
             # generate it.
-            without_ordering = self.ordering_parts.search(sql).group(1)
+            without_ordering = self.ordering_parts.search(sql)[1]
             params_hash = make_hashable(params)
             if (without_ordering, params_hash) in seen:
                 continue
@@ -391,7 +400,7 @@ class SQLCompiler:
         if self.query.distinct and not self.query.distinct_fields:
             select_sql = [t[1] for t in select]
             for expr, (sql, params, is_ref) in order_by:
-                without_ordering = self.ordering_parts.search(sql).group(1)
+                without_ordering = self.ordering_parts.search(sql)[1]
                 if not is_ref and (without_ordering, params) not in select_sql:
                     extra_select.append((expr, (without_ordering, params), None))
         return extra_select
@@ -540,19 +549,26 @@ class SQLCompiler:
                     nowait = self.query.select_for_update_nowait
                     skip_locked = self.query.select_for_update_skip_locked
                     of = self.query.select_for_update_of
-                    # If it's a NOWAIT/SKIP LOCKED/OF query but the backend
-                    # doesn't support it, raise NotSupportedError to prevent a
-                    # possible deadlock.
+                    no_key = self.query.select_for_no_key_update
+                    # If it's a NOWAIT/SKIP LOCKED/OF/NO KEY query but the
+                    # backend doesn't support it, raise NotSupportedError to
+                    # prevent a possible deadlock.
                     if nowait and not self.connection.features.has_select_for_update_nowait:
                         raise NotSupportedError('NOWAIT is not supported on this database backend.')
                     elif skip_locked and not self.connection.features.has_select_for_update_skip_locked:
                         raise NotSupportedError('SKIP LOCKED is not supported on this database backend.')
                     elif of and not self.connection.features.has_select_for_update_of:
                         raise NotSupportedError('FOR UPDATE OF is not supported on this database backend.')
+                    elif no_key and not self.connection.features.has_select_for_no_key_update:
+                        raise NotSupportedError(
+                            'FOR NO KEY UPDATE is not supported on this '
+                            'database backend.'
+                        )
                     for_update_part = self.connection.ops.for_update_sql(
                         nowait=nowait,
                         skip_locked=skip_locked,
                         of=self.get_select_for_update_of_arguments(),
+                        no_key=no_key,
                     )
 
                 if for_update_part and self.connection.features.for_update_after_from:
@@ -709,9 +725,9 @@ class SQLCompiler:
         field, targets, alias, joins, path, opts, transform_function = self._setup_joins(pieces, opts, alias)
 
         # If we get to this point and the field is a relation to another model,
-        # append the default ordering for that model unless the attribute name
-        # of the field is specified.
-        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name:
+        # append the default ordering for that model unless it is the pk
+        # shortcut or the attribute name of the field that is specified.
+        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
             # Firstly, avoid infinite loops.
             already_seen = already_seen or set()
             join_tuple = tuple(getattr(self.query.alias_map[j], 'join_cols', None) for j in joins)
@@ -961,19 +977,34 @@ class SQLCompiler:
         the query.
         """
         def _get_parent_klass_info(klass_info):
-            return (
-                {
+            for parent_model, parent_link in klass_info['model']._meta.parents.items():
+                parent_list = parent_model._meta.get_parent_list()
+                yield {
                     'model': parent_model,
                     'field': parent_link,
                     'reverse': False,
                     'select_fields': [
                         select_index
                         for select_index in klass_info['select_fields']
-                        if self.select[select_index][0].target.model == parent_model
+                        # Selected columns from a model or its parents.
+                        if (
+                            self.select[select_index][0].target.model == parent_model or
+                            self.select[select_index][0].target.model in parent_list
+                        )
                     ],
                 }
-                for parent_model, parent_link in klass_info['model']._meta.parents.items()
-            )
+
+        def _get_first_selected_col_from_model(klass_info):
+            """
+            Find the first selected column from a model. If it doesn't exist,
+            don't lock a model.
+
+            select_fields is filled recursively, so it also contains fields
+            from the parent models.
+            """
+            for select_index in klass_info['select_fields']:
+                if self.select[select_index][0].target.model == klass_info['model']:
+                    return self.select[select_index][0]
 
         def _get_field_choices():
             """Yield all allowed field paths in breadth-first search order."""
@@ -1002,14 +1033,7 @@ class SQLCompiler:
         for name in self.query.select_for_update_of:
             klass_info = self.klass_info
             if name == 'self':
-                # Find the first selected column from a base model. If it
-                # doesn't exist, don't lock a base model.
-                for select_index in klass_info['select_fields']:
-                    if self.select[select_index][0].target.model == klass_info['model']:
-                        col = self.select[select_index][0]
-                        break
-                else:
-                    col = None
+                col = _get_first_selected_col_from_model(klass_info)
             else:
                 for part in name.split(LOOKUP_SEP):
                     klass_infos = (
@@ -1029,8 +1053,7 @@ class SQLCompiler:
                 if klass_info is None:
                     invalid_names.append(name)
                     continue
-                select_index = klass_info['select_fields'][0]
-                col = self.select[select_index][0]
+                col = _get_first_selected_col_from_model(klass_info)
             if col is not None:
                 if self.connection.features.select_for_update_of_column:
                     result.append(self.compile(col)[0])
@@ -1378,15 +1401,17 @@ class SQLInsertCompiler(SQLCompiler):
                 return self.connection.ops.fetch_returned_insert_rows(cursor)
             if self.connection.features.can_return_columns_from_insert:
                 assert len(self.query.objs) == 1
-                return self.connection.ops.fetch_returned_insert_columns(cursor, self.returning_params)
-            return [self.connection.ops.last_insert_id(
+                return [self.connection.ops.fetch_returned_insert_columns(cursor, self.returning_params)]
+            return [(self.connection.ops.last_insert_id(
                 cursor, self.query.get_meta().db_table, self.query.get_meta().pk.column
-            )]
+            ),)]
 
 
 class SQLDeleteCompiler(SQLCompiler):
     @cached_property
     def single_alias(self):
+        # Ensure base table is in aliases.
+        self.query.get_initial_alias()
         return sum(self.query.alias_refcount[t] > 0 for t in self.query.alias_map) == 1
 
     def _as_sql(self, query):

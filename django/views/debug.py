@@ -47,13 +47,13 @@ def technical_500_response(request, exc_type, exc_value, tb, status_code=500):
     Create a technical server error response. The last three arguments are
     the values returned from sys.exc_info() and friends.
     """
-    reporter = ExceptionReporter(request, exc_type, exc_value, tb)
-    if request.is_ajax():
-        text = reporter.get_traceback_text()
-        return HttpResponse(text, status=status_code, content_type='text/plain; charset=utf-8')
-    else:
+    reporter = get_exception_reporter_class(request)(request, exc_type, exc_value, tb)
+    if request.accepts('text/html'):
         html = reporter.get_traceback_html()
         return HttpResponse(html, status=status_code, content_type='text/html')
+    else:
+        text = reporter.get_traceback_text()
+        return HttpResponse(text, status=status_code, content_type='text/plain; charset=utf-8')
 
 
 @functools.lru_cache()
@@ -65,6 +65,11 @@ def get_default_exception_reporter_filter():
 def get_exception_reporter_filter(request):
     default_filter = get_default_exception_reporter_filter()
     return getattr(request, 'exception_reporter_filter', default_filter)
+
+
+def get_exception_reporter_class(request):
+    default_exception_reporter_class = import_string(settings.DEFAULT_EXCEPTION_REPORTER)
+    return getattr(request, 'exception_reporter_class', default_exception_reporter_class)
 
 
 class SafeExceptionReporterFilter:
@@ -85,6 +90,10 @@ class SafeExceptionReporterFilter:
                 cleansed = self.cleansed_substitute
             elif isinstance(value, dict):
                 cleansed = {k: self.cleanse_setting(k, v) for k, v in value.items()}
+            elif isinstance(value, list):
+                cleansed = [self.cleanse_setting('', v) for v in value]
+            elif isinstance(value, tuple):
+                cleansed = tuple([self.cleanse_setting('', v) for v in value])
             else:
                 cleansed = value
         except TypeError:
@@ -364,7 +373,7 @@ class ExceptionReporter:
                 # (https://www.python.org/dev/peps/pep-0263/)
                 match = re.search(br'coding[:=]\s*([-\w.]+)', line)
                 if match:
-                    encoding = match.group(1).decode('ascii')
+                    encoding = match[1].decode('ascii')
                     break
             source = [str(sline, encoding, 'replace') for sline in source]
 

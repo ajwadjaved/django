@@ -190,14 +190,14 @@ class RegexPattern(CheckURLMixin):
         except re.error as e:
             raise ImproperlyConfigured(
                 '"%s" is not a valid regular expression: %s' % (regex, e)
-            )
+            ) from e
 
     def __str__(self):
         return str(self._regex)
 
 
 _PATH_PARAMETER_COMPONENT_RE = _lazy_re_compile(
-    r'<(?:(?P<converter>[^>:]+):)?(?P<parameter>\w+)>'
+    r'<(?:(?P<converter>[^>:]+):)?(?P<parameter>[^>]+)>'
 )
 
 
@@ -220,13 +220,13 @@ def _route_to_regex(route, is_endpoint=False):
             break
         parts.append(re.escape(route[:match.start()]))
         route = route[match.end():]
-        parameter = match.group('parameter')
+        parameter = match['parameter']
         if not parameter.isidentifier():
             raise ImproperlyConfigured(
                 "URL route '%s' uses parameter name %r which isn't a valid "
                 "Python identifier." % (original_route, parameter)
             )
-        raw_converter = match.group('converter')
+        raw_converter = match['converter']
         if raw_converter is None:
             # If a converter isn't specified, the default is `str`.
             raw_converter = 'str'
@@ -234,8 +234,9 @@ def _route_to_regex(route, is_endpoint=False):
             converter = get_converter(raw_converter)
         except KeyError as e:
             raise ImproperlyConfigured(
-                "URL route '%s' uses invalid converter %s." % (original_route, e)
-            )
+                'URL route %r uses invalid converter %r.'
+                % (original_route, raw_converter)
+            ) from e
         converters[parameter] = converter
         parts.append('(?P<' + parameter + '>' + converter.regex + ')')
     if is_endpoint:
@@ -588,13 +589,13 @@ class URLResolver:
         patterns = getattr(self.urlconf_module, "urlpatterns", self.urlconf_module)
         try:
             iter(patterns)
-        except TypeError:
+        except TypeError as e:
             msg = (
                 "The included URLconf '{name}' does not appear to have any "
                 "patterns in it. If you see valid patterns in the file then "
                 "the issue is probably caused by a circular import."
             )
-            raise ImproperlyConfigured(msg.format(name=self.urlconf_name))
+            raise ImproperlyConfigured(msg.format(name=self.urlconf_name)) from e
         return patterns
 
     def resolve_error_handler(self, view_type):
@@ -669,7 +670,7 @@ class URLResolver:
             if args:
                 arg_msg = "arguments '%s'" % (args,)
             elif kwargs:
-                arg_msg = "keyword arguments '%s'" % (kwargs,)
+                arg_msg = "keyword arguments '%s'" % kwargs
             else:
                 arg_msg = "no arguments"
             msg = (

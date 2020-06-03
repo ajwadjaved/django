@@ -33,7 +33,7 @@ def set_language(request):
     """
     next_url = request.POST.get('next', request.GET.get('next'))
     if (
-        (next_url or not request.is_ajax()) and
+        (next_url or request.accepts('text/html')) and
         not url_has_allowed_host_and_scheme(
             url=next_url,
             allowed_hosts={request.get_host()},
@@ -196,8 +196,8 @@ class JavaScriptCatalog(View):
     Return the selected language catalog as a JavaScript library.
 
     Receive the list of packages to check for translations in the `packages`
-    kwarg either from the extra dictionary passed to the url() function or as a
-    plus-sign delimited string from the request. Default is 'django.conf'.
+    kwarg either from the extra dictionary passed to the path() function or as
+    a plus-sign delimited string from the request. Default is 'django.conf'.
 
     You can override the gettext domain for this view, but usually you don't
     want to do that as JavaScript messages go to the djangojs domain. This
@@ -237,7 +237,7 @@ class JavaScriptCatalog(View):
         """
         match = re.search(r'nplurals=\s*(\d+)', self._plural_string or '')
         if match:
-            return int(match.groups()[0])
+            return int(match[1])
         return 2
 
     @property
